@@ -1,0 +1,8 @@
+name: human-detect-analysis
+description: Captures a picture every 10s, detects a person, and serves the latest detection snapshot over HTTP at /snapshot.
+ports: []
+bricks:
+- arduino:web_ui: {}
+- arduino:object_detection:
+    model: yolox-object-detection
+icon: 🧍
