@@ -1,23 +1,35 @@
+import argparse
+import base64
 import threading
 import time
-from io import BytesIO
 
-import ollama
 import pyttsx3
 import socketio
-from PIL import Image
+from openai import OpenAI
 
 BOARD_URL = "http://192.168.1.71:7000"
 DOWNSCALED_PATH = r"C:\Users\qiaos\VLM\detect_downscaled.jpg"
-DOWNSCALED_PATH_FALL = r"C:\Users\qiaos\VLM\senior_fall.jpg"
-DOWNSCALED_PATH_PAIN = r"C:\Users\qiaos\VLM\senior_pain.jpg"
-READ_INTERVAL_SEC = 15.0  # board pushes every ~10s; only act on one roughly every this many seconds
+#DOWNSCALED_PATH = r"C:\Users\qiaos\VLM\senior-sit-on-ground.jpg"
+DOWNSCALED_PATH_FALL = r"C:\Users\qiaos\VLM\detect_downscaled.jpg"
+#DOWNSCALED_PATH_FALL = r"C:\Users\qiaos\VLM\samples\senior-sit-on-ground.jpg"
+READ_INTERVAL_SEC = 3.0  # board pushes every ~3s; only act on one roughly every this many seconds
+VLM_MODEL = "qwen3vl-flash:4b"
 PROMPT = (
-    'If the person upper body is not upright, answer "Fall" and quit'
-    'If the person is on the ground, answer "Fall" and quit'
-    'If the person in the image is in pain, answer "In pain" and quit'
-    'Otherwise, answer "All Good"'
-    #'Describe the person behavior less than 20 words"'
+    "Analyze the person in the image step-by-step according to these strict rules and the strict order.\n "
+    #"Output ONLY the final matching string. Do not include any explanation.\n"
+    "Once a rule triggers a stop condition, that is your final classification.\n\n"
+    "Rules:\n"
+    "1. If the person in the image is in pain, output 'In pain' and stop.\n"
+    "2. If the person doesn't stand up firmly and not sit on chair or sofa, output 'Fall' and stop.\n"
+    "3. If the person is on the ground and not exercising, output 'Fall' and stop.\n"
+    "4. Otherwise, output 'All Good'. \n"
+     
+)
+
+# FastFlowLM's local OpenAI-compatible endpoint
+client = OpenAI(
+    base_url="http://localhost:52625/v1",
+    api_key="not-needed-for-local"
 )
 
 sio = socketio.Client()
@@ -29,6 +41,28 @@ sio = socketio.Client()
 busy_lock = threading.Lock()
 last_accepted_at = 0.0
 busy_notice_printed = False  # only print the "still analyzing" notice once per busy stretch, not per skipped frame
+
+def ask_vlm(image_bytes):
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    response = client.chat.completions.create(
+        model=VLM_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                    }
+                ]
+            }
+        ],
+        stream=False,
+        temperature=0.0
+    )
+    return response.choices[0].message.content.strip()
+
 
 def speak_alert(message):
     # pyttsx3's SAPI5 driver on Windows only reliably speaks once per
@@ -54,30 +88,13 @@ def disconnect():
 
 def analyze(raw_image_bytes, timestamp):
     try:
-        image = Image.open(BytesIO(raw_image_bytes))
-        # LANCZOS gives sharper downscaled detail than the default nearest-
-        # neighbor resize; quality=100 and subsampling=0 match the original's
-        # own quality=100 encoding so file size tracks the pixel-area
-        # reduction instead of compounding with extra lossy compression.
-        downscaled = image.resize(
-            (image.width // 2, image.height // 2), Image.LANCZOS
-        )
-        buf = BytesIO()
-        downscaled.save(buf, format="JPEG", quality=100, subsampling=0)
-        downscaled_bytes = buf.getvalue()
-
         with open(DOWNSCALED_PATH, "wb") as f:
-            f.write(downscaled_bytes)
+            f.write(raw_image_bytes)
 
         vlm_start = time.time()
-        response = ollama.generate(
-            model='qwen2.5vl:7b',
-            prompt=PROMPT,
-            images=[downscaled_bytes]  # Pass the downscaled image, not the original
-        )
+        result = ask_vlm(raw_image_bytes)
         vlm_delay = time.time() - vlm_start
 
-        result = response["response"]
         print(f"[{timestamp}] ({vlm_delay:.2f}s) {result}")
 
         result_lower = result.lower()
@@ -89,6 +106,17 @@ def analyze(raw_image_bytes, timestamp):
         print(f"[{timestamp}] Analysis failed: {e!r}")
     finally:
         busy_lock.release()
+
+
+def analyze_from_file(path):
+    with open(path, "rb") as f:
+        image_bytes = f.read()
+
+    vlm_start = time.time()
+    result = ask_vlm(image_bytes)
+    vlm_delay = time.time() - vlm_start
+
+    print(f"({vlm_delay:.2f}s) {result}")
 
 
 @sio.on("snapshot")
@@ -119,5 +147,15 @@ def on_snapshot(data):
 
 
 if __name__ == "__main__":
-    sio.connect(BOARD_URL)
-    sio.wait()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-n", action="store_true",
+        help="Analyze the local image at DOWNSCALED_PATH_FALL instead of connecting to the board, then exit"
+    )
+    args = parser.parse_args()
+
+    if args.n:
+        analyze_from_file(DOWNSCALED_PATH_FALL)
+    else:
+        sio.connect(BOARD_URL)
+        sio.wait()
